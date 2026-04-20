@@ -10,6 +10,17 @@ export async function GET(req) {
     const { searchParams } = new URL(req.url);
     const maxResults = Math.min(parseInt(searchParams.get('limit') || '50'), 100);
 
+    // Get our email address first
+    const profileResponse = await fetch(
+      'https://gateway.maton.ai/google-mail/gmail/v1/users/me/profile',
+      { headers: { 'Authorization': `Bearer ${apiKey}` } }
+    );
+    let myEmail = '';
+    if (profileResponse.ok) {
+      const profile = await profileResponse.json();
+      myEmail = profile.emailAddress || '';
+    }
+
     // Fetch recent sent emails
     const sentResponse = await fetch(
       `https://gateway.maton.ai/google-mail/gmail/v1/users/me/messages?labelIds=SENT&maxResults=${maxResults}`,
@@ -28,13 +39,11 @@ export async function GET(req) {
       return NextResponse.json({ leads: [], summary: { total: 0, replied: 0, interested: 0, not_interested: 0, no_reply: 0, bounced: 0 } });
     }
 
-    // Fetch details for each sent message and check thread for replies
     const leads = [];
     const seen_threads = new Set();
 
     for (const msg of messages) {
       try {
-        // Get the full message details
         const msgResponse = await fetch(
           `https://gateway.maton.ai/google-mail/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date`,
           { headers: { 'Authorization': `Bearer ${apiKey}` } }
@@ -49,11 +58,10 @@ export async function GET(req) {
         const date = headers.find(h => h.name.toLowerCase() === 'date')?.value || '';
         const threadId = msgData.threadId;
 
-        // Skip if we already processed this thread (avoid duplicates from follow-ups)
         if (seen_threads.has(threadId)) continue;
         seen_threads.add(threadId);
 
-        // Get the thread to check for replies
+        // Get thread to check for replies
         const threadResponse = await fetch(
           `https://gateway.maton.ai/google-mail/gmail/v1/users/me/threads/${threadId}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`,
           { headers: { 'Authorization': `Bearer ${apiKey}` } }
@@ -68,47 +76,39 @@ export async function GET(req) {
           const threadData = await threadResponse.json();
           const threadMessages = threadData.messages || [];
 
-          // Check if any message in thread is NOT from us (i.e. a reply)
           if (threadMessages.length > 1) {
-            // Get our email to filter
-            const profileResponse = await fetch(
-              'https://gateway.maton.ai/google-mail/gmail/v1/users/me/profile',
-              { headers: { 'Authorization': `Bearer ${apiKey}` } }
-            );
-            let myEmail = '';
-            if (profileResponse.ok) {
-              const profile = await profileResponse.json();
-              myEmail = profile.emailAddress || '';
-            }
-
             for (let i = threadMessages.length - 1; i >= 1; i--) {
               const replyHeaders = threadMessages[i].payload?.headers || [];
               const replyFrom = replyHeaders.find(h => h.name.toLowerCase() === 'from')?.value || '';
 
               if (!replyFrom.includes(myEmail)) {
-                status = 'replied';
                 reply_snippet = threadMessages[i].snippet || '';
                 reply_from = replyFrom;
-
-                // Determine sentiment from snippet
                 const lower = reply_snippet.toLowerCase();
-                if (lower.includes('interested') || lower.includes('yes') || lower.includes('love to') || lower.includes('let\'s') || lower.includes('sounds good') || lower.includes('tell me more') || lower.includes('schedule')) {
-                  sentiment = 'interested';
-                } else if (lower.includes('unsubscribe') || lower.includes('not interested') || lower.includes('remove') || lower.includes('stop') || lower.includes('no thank') || lower.includes('don\'t contact')) {
-                  sentiment = 'not_interested';
+
+                // Check for bounce/delivery failure first
+                if (replyFrom.includes('mailer-daemon') || replyFrom.includes('postmaster') || 
+                    lower.includes('address not found') || lower.includes('undeliverable') || 
+                    lower.includes('delivery failed') || lower.includes('wasn\'t delivered') ||
+                    lower.includes('mail delivery') || lower.includes('permanent failure') ||
+                    lower.includes('rejected') || lower.includes('does not exist')) {
+                  status = 'bounced';
+                  sentiment = 'bounced';
+                } else {
+                  status = 'replied';
+                  // Sentiment analysis
+                  if (lower.includes('interested') || lower.includes('yes') || lower.includes('love to') || 
+                      lower.includes('let\'s') || lower.includes('sounds good') || lower.includes('tell me more') || 
+                      lower.includes('schedule') || lower.includes('would like') || lower.includes('happy to')) {
+                    sentiment = 'interested';
+                  } else if (lower.includes('unsubscribe') || lower.includes('not interested') || 
+                             lower.includes('remove') || lower.includes('stop') || lower.includes('no thank') || 
+                             lower.includes('don\'t contact') || lower.includes('opt out')) {
+                    sentiment = 'not_interested';
+                  }
                 }
                 break;
               }
-            }
-          }
-
-          // Check for bounces
-          const labels = threadMessages[threadMessages.length - 1]?.labelIds || [];
-          if (labels.includes('CATEGORY_UPDATES') && threadMessages.length > 1) {
-            const lastSnippet = (threadMessages[threadMessages.length - 1]?.snippet || '').toLowerCase();
-            if (lastSnippet.includes('delivery') || lastSnippet.includes('undeliverable') || lastSnippet.includes('bounced') || lastSnippet.includes('failed')) {
-              status = 'bounced';
-              sentiment = 'bounced';
             }
           }
         }
@@ -120,7 +120,7 @@ export async function GET(req) {
           subject,
           dateSent: date,
           status,
-          sentiment: status === 'replied' ? sentiment : (status === 'bounced' ? 'bounced' : 'neutral'),
+          sentiment,
           replySnippet: reply_snippet,
           replyFrom: reply_from,
         });
@@ -129,7 +129,6 @@ export async function GET(req) {
       }
     }
 
-    // Build summary
     const summary = {
       total: leads.length,
       replied: leads.filter(l => l.status === 'replied').length,
